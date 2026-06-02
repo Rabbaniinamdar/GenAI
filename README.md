@@ -929,16 +929,830 @@ public String getBalance(String accountId) {
 
 ---
 
-## 👤 About
+# 🏦 AI Banking Customer Support Chatbot — Architecture Deep Dive
 
-Java Full Stack Engineer | 2.5 years experience | Upskilling in Generative AI
-
-**Core stack:** Angular · Spring Boot · JWT · AWS Lambda · API Gateway · DynamoDB · S3
-
-**Certifications:** Google Cloud Digital Leader
-
-**Currently building:** CitiCore Banking Platform — Citibank-inspired microservices project with Spring Boot, MySQL, AWS, and Jenkins.
+> **Tech Stack:** Spring Boot · Spring AI · Gemini 2.0 Flash · RAG · Pinecone · Redis · Kafka  
+> **Purpose:** Production-ready AI assistant for banking with accurate, policy-grounded responses  
+> **Interview Relevance:** Covers LLMs, RAG, Vector DBs, Embeddings, Prompt Engineering, Agents
 
 ---
 
-*These notes are actively maintained as part of a Java → Java+GenAI upskilling journey. Star ⭐ the repo if you find it useful!*
+## 📋 Table of Contents
+
+1. [Complete Architecture Flow](#architecture-flow)
+2. [What is an LLM?](#llm)
+3. [What is Spring AI?](#spring-ai)
+4. [What is RAG?](#rag)
+5. [Chunking](#chunking)
+6. [Embeddings & Embedding Models](#embeddings)
+7. [Vectors & Vector Search](#vectors)
+8. [Pinecone — Vector Database](#pinecone)
+9. [Why Not MySQL for RAG?](#why-not-mysql)
+10. [Similarity Search](#similarity-search)
+11. [Redis — Conversation Memory](#redis)
+12. [Prompt Engineering](#prompt-engineering)
+13. [Hallucination](#hallucination)
+14. [Intent Detection](#intent-detection)
+15. [Kafka — Event Streaming](#kafka)
+16. [Complete Query Lifecycle](#query-lifecycle)
+17. [Interview Questions & Answers](#interview-qa)
+18. [What to Learn Next](#next-steps)
+
+---
+
+## 1. Complete Architecture Flow <a name="architecture-flow"></a>
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     CITICORE AI CHATBOT                         │
+│                                                                  │
+│  Customer (Angular/React UI)                                     │
+│       │                                                          │
+│       ▼                                                          │
+│  Spring Boot Chatbot Service (port 8087)                         │
+│       │                                                          │
+│       ├──► Intent Detection (Rule-based NLP)                     │
+│       │         │ TRANSFER / BALANCE / LOAN / CREDIT_CARD        │
+│       │                                                          │
+│       ├──► Redis (Conversation Memory)                           │
+│       │         │ last N messages for context                    │
+│       │                                                          │
+│       ├──► RAG Pipeline                                          │
+│       │         │                                                │
+│       │         ▼                                                │
+│       │    Embed user query → text-embedding-004                 │
+│       │         │                                                │
+│       │         ▼                                                │
+│       │    Pinecone similarity search (top-3, score > 0.70)      │
+│       │         │                                                │
+│       │         ▼                                                │
+│       │    Relevant banking policy chunks returned               │
+│       │                                                          │
+│       ├──► Prompt Construction                                   │
+│       │         │ System prompt + Context + History + Query      │
+│       │                                                          │
+│       ├──► Gemini 2.0 Flash (LLM)                               │
+│       │         │ Generates grounded, accurate response          │
+│       │                                                          │
+│       ├──► Persist to Redis + MySQL                              │
+│       │                                                          │
+│       └──► Kafka (Analytics Event)                               │
+│                 │                                                │
+│                 ▼                                                │
+│           citicore.chat.analytics topic                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why this architecture?**  
+Each component solves a specific problem. Without Redis, the bot forgets context. Without RAG, the bot hallucinates. Without Kafka, you lose analytics. Every piece is intentional.
+
+---
+
+## 2. What is an LLM (Large Language Model)? <a name="llm"></a>
+
+### What it is
+An LLM is a neural network trained on massive amounts of text data. It learns statistical patterns across billions of words, enabling it to understand language, reason, summarize, and generate human-like responses.
+
+### How it works (simplified)
+```
+Input Text
+    │
+    ▼
+Tokenization        "What is NEFT?" → ["What", "is", "NEFT", "?"]
+    │
+    ▼
+Embedding Layer     Each token → high-dimensional vector
+    │
+    ▼
+Transformer Blocks  Self-attention: "NEFT" relates to "transfer", "limit", "banking"
+    │
+    ▼
+Output Layer        Predicts next most-likely token, one at a time
+    │
+    ▼
+Response            "NEFT (National Electronic Funds Transfer) allows..."
+```
+
+### Why Gemini 2.0 Flash specifically?
+| Model | Why chosen |
+|---|---|
+| Gemini 2.0 Flash | Free tier, fast, supports OpenAI-compatible API |
+| GPT-4o | Excellent but paid |
+| Claude 3 | Great reasoning but paid |
+| Llama 3 | Open source but requires self-hosting |
+
+### Without LLM vs With LLM
+```
+❌ Without LLM:
+User: "Can I send money to another bank?"
+System: Keyword match fails → "Sorry, I don't understand"
+
+✅ With LLM:
+User: "Can I send money to another bank?"
+LLM: Understands intent → "Yes, you can use NEFT/RTGS/IMPS..."
+```
+
+---
+
+## 3. What is Spring AI? <a name="spring-ai"></a>
+
+### What it is
+Spring AI is Spring's abstraction layer over AI providers. Just as Spring Data JPA abstracts different databases behind `JpaRepository`, Spring AI abstracts different LLM providers behind `ChatClient`.
+
+### Why it matters
+Without Spring AI, switching from OpenAI to Gemini would require rewriting all API call logic. With Spring AI, you only change the configuration.
+
+```java
+// Spring AI — same code works for Gemini, OpenAI, Claude, Ollama
+@Autowired
+private ChatClient chatClient;
+
+ChatResponse response = chatClient
+        .prompt()
+        .system("You are a banking assistant.")
+        .user("What is NEFT?")
+        .call()
+        .chatResponse();
+
+String text = response.getResult().getOutput().getText();
+```
+
+### Spring AI abstractions
+```
+ChatClient        → Send messages, get responses
+EmbeddingModel    → Convert text to vectors
+VectorStore       → Store and search vectors
+ChatMemory        → Manage conversation history
+DocumentReader    → Load PDFs, text files for RAG
+TextSplitter      → Chunk documents for embedding
+```
+
+### How Gemini works via OpenAI-compatible API
+```
+Your Code (OpenAI client)
+        │
+        ▼
+POST https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+        │
+        ▼ (Google translates OpenAI format → Gemini internally)
+Gemini 2.0 Flash processes the request
+        │
+        ▼
+Response in OpenAI format (Spring AI parses this)
+        │
+        ▼
+ChatResponse object in your Java code
+```
+
+This is why you use `spring-ai-starter-model-openai` — you're using the OpenAI-format client pointed at Google's servers.
+
+---
+
+## 4. What is RAG (Retrieval Augmented Generation)? <a name="rag"></a>
+
+### The core problem RAG solves
+LLMs are trained on public internet data. They have **no knowledge** of:
+- Your bank's specific transfer limits
+- Your internal product policies
+- Recent regulatory changes
+- Customer-specific account data
+
+RAG bridges this gap by **retrieving** relevant private documents and **augmenting** the LLM's prompt with that context before generation.
+
+### The three phases of RAG
+
+#### Phase 1: Ingestion (done once, offline)
+```
+Banking Policy PDFs
+        │
+        ▼
+DocumentReader (load PDF)
+        │
+        ▼
+TextSplitter (chunk into 500-char pieces)
+        │
+        ▼
+EmbeddingModel (text-embedding-004)
+        │                                     
+        ▼                                     
+Pinecone (store vector + original text)       
+```
+
+#### Phase 2: Retrieval (every query)
+```
+User Query: "What is the NEFT limit?"
+        │
+        ▼
+EmbeddingModel → query vector [0.23, 0.71, -0.14, ...]
+        │
+        ▼
+Pinecone cosine similarity search
+        │
+        ▼
+Top-3 matching chunks returned (similarity > 0.70)
+```
+
+#### Phase 3: Generation (every query)
+```
+System Prompt + Retrieved Chunks + Chat History + User Query
+        │
+        ▼
+Gemini 2.0 Flash
+        │
+        ▼
+Grounded, accurate response citing actual bank policy
+```
+
+### RAG vs No RAG
+```
+❌ Without RAG:
+User: "What is CitiCore's NEFT daily limit?"
+Gemini (from training): "NEFT limit is ₹2 lakh" ← HALLUCINATION, wrong bank
+
+✅ With RAG:
+Retrieved chunk: "CitiCore NEFT daily limit: ₹20,00,000 (₹20 lakh)"
+Gemini: "According to CitiCore's policy, your daily NEFT limit is ₹20 lakh."
+```
+
+---
+
+## 5. Chunking <a name="chunking"></a>
+
+### Why chunking is necessary
+LLMs have a context window limit (e.g., Gemini Flash: ~1M tokens, but injecting 200 pages into every prompt is wasteful and slow). You only want to inject the **relevant 2-3 paragraphs**, not the entire PDF.
+
+### How chunking works
+```
+BankingPolicy.pdf (200 pages)
+        │
+        ▼ TextSplitter
+┌─────────────────────┐
+│ Chunk 1 (500 chars) │ ← "NEFT: National Electronic Funds Transfer allows..."
+├─────────────────────┤
+│ Chunk 2 (500 chars) │ ← "NEFT daily limit: ₹20 lakh. Transaction fee..."
+├─────────────────────┤
+│ Chunk 3 (500 chars) │ ← "RTGS minimum amount: ₹2 lakh. Available 24x7..."
+└─────────────────────┘
+         ...more chunks
+```
+
+### Why chunk overlap matters
+```yaml
+chunk-size: 500
+chunk-overlap: 50
+```
+
+```
+Without overlap:
+[...sentence about NEFT limit ends here] | [Next sentence continues here...]
+                                          ↑
+                             Meaning is LOST at boundary
+
+With 50-char overlap:
+[...sentence about NEFT limit ends here, continues] | [continues here...]
+                                                       ↑
+                                         Context PRESERVED
+```
+
+### Chunk size trade-offs
+| Chunk Size | Pros | Cons |
+|---|---|---|
+| Small (200 chars) | Precise retrieval | Loses surrounding context |
+| Medium (500 chars) | Balance of both | Good default |
+| Large (1000+ chars) | Rich context | May retrieve irrelevant content |
+
+---
+
+## 6. Embeddings & Embedding Models <a name="embeddings"></a>
+
+### What is an embedding?
+An embedding is a **dense numerical representation** of text that captures semantic meaning. Words/phrases with similar meanings have similar embeddings (mathematically close vectors).
+
+### Why numbers instead of text?
+Computers cannot directly compare meaning. But they CAN compute distance between numbers. Embeddings convert meaning → distance-computable numbers.
+
+```
+"NEFT transfer"           → [0.12, 0.54, 0.76, 0.22, ...]
+"Online fund transfer"    → [0.11, 0.52, 0.79, 0.24, ...]  ← very close!
+"Cricket match score"     → [0.89, -0.32, 0.14, 0.67, ...] ← far away
+```
+
+### The embedding model in this project
+`text-embedding-004` (Google) outputs **768-dimensional vectors**.
+
+```
+"What is the NEFT limit?"
+        │
+        ▼
+text-embedding-004
+        │
+        ▼
+[0.112, 0.883, 0.221, -0.054, 0.776, ...] (768 numbers)
+```
+
+### Why 768 dimensions?
+More dimensions = richer semantic representation, but more storage. 768 is Google's sweet spot for quality vs cost. OpenAI's `text-embedding-3-small` uses 1536 dimensions.
+
+> ⚠️ **Critical:** The dimension count MUST match between the embedding model and Pinecone index. If you create a Pinecone index with 1536 dimensions but your model outputs 768 — it crashes.
+
+---
+
+## 7. Vectors & Vector Search <a name="vectors"></a>
+
+### What is a vector?
+A vector is a point in high-dimensional space. Similar sentences are "nearby" points.
+
+### Cosine Similarity
+This is how Pinecone measures "how similar" two vectors are:
+
+```
+similarity = cos(θ) = (A · B) / (|A| × |B|)
+
+Range: -1 to +1
+  1.0  = identical meaning
+  0.8+ = very similar (great match)
+  0.7  = your threshold — included
+  0.5  = loosely related
+  0.0  = completely unrelated
+ -1.0  = opposite meaning
+```
+
+### Why cosine, not Euclidean distance?
+Cosine similarity measures **angle** between vectors (direction/meaning), not magnitude. Two documents about NEFT — one short, one long — will have similar angles even if different magnitudes.
+
+---
+
+## 8. Pinecone — Vector Database <a name="pinecone"></a>
+
+### What is Pinecone?
+Pinecone is a managed vector database purpose-built for semantic search. Unlike MySQL (optimized for exact matches), Pinecone is optimized for finding the "nearest neighbors" in high-dimensional vector space — at millisecond speed across millions of vectors.
+
+### How your Pinecone setup works
+```yaml
+vectorstore:
+  pinecone:
+    index-name: citicore-knowledge-base   # your index
+    namespace: banking-docs               # logical partition
+    distance-type: cosine                 # similarity algorithm
+```
+
+### Namespace as a multi-tenant strategy
+```
+citicore-knowledge-base (Pinecone Index)
+├── banking-docs        ← general banking FAQs
+├── loan-docs           ← loan policies
+├── insurance-docs      ← insurance products
+└── regulatory-docs     ← RBI guidelines
+```
+
+You can query a specific namespace to limit search scope — faster and more precise.
+
+### What gets stored in Pinecone
+```
+┌────────────────────────────────────────────────────────┐
+│ Vector ID: uuid-1234                                    │
+│ Vector: [0.112, 0.883, 0.221, ...] (768 floats)        │
+│ Metadata:                                               │
+│   source: "banking-faq.txt"                             │
+│   chunk_index: 3                                        │
+│   text: "NEFT daily limit is ₹20,00,000..."            │
+└────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 9. Why Not MySQL for RAG? <a name="why-not-mysql"></a>
+
+### The keyword search problem
+```sql
+-- MySQL LIKE search
+SELECT * FROM documents WHERE content LIKE '%NEFT%';
+```
+
+**Problem:**
+```
+User query: "How much can I transfer daily?"
+MySQL LIKE '%transfer%' → finds "transfer" ✅
+MySQL LIKE '%how much%' → finds "how much" ✅ (maybe)
+MySQL LIKE '%daily limit%' → maybe ✅
+
+But: "What's the cap on online remittance?"
+MySQL LIKE '%remittance%' → ❌ MISSES the NEFT policy doc
+```
+
+MySQL doesn't understand that "remittance" = "transfer" semantically.
+
+### Comparison
+
+| Feature | MySQL | Pinecone |
+|---|---|---|
+| Search type | Keyword/exact match | Semantic/meaning-based |
+| Query | `LIKE '%neft%'` | embed query → nearest vectors |
+| Understands synonyms | ❌ No | ✅ Yes |
+| Speed at scale | Slow (full table scan) | Fast (ANN indexing) |
+| Use case | Structured data, filters | Unstructured text, semantic search |
+| Use in this project | Chat sessions, user data | Knowledge base retrieval |
+
+### The right tool for the right job
+MySQL and Pinecone **coexist** in this project:
+- **MySQL/H2** → stores `chat_sessions`, `chat_messages` (structured)
+- **Pinecone** → stores banking policy chunks (semantic search)
+
+---
+
+## 10. Similarity Search <a name="similarity-search"></a>
+
+### End-to-end flow
+```
+User: "How much can I transfer daily through NEFT?"
+        │
+        ▼  Step 1: Embed the query
+[0.23, 0.71, -0.14, 0.88, ...]
+        │
+        ▼  Step 2: Pinecone ANN search
+Compare against all stored vectors using cosine similarity
+        │
+        ▼  Step 3: Return top-3 above threshold 0.70
+┌──────────────────────────────────────────────────┐
+│ Score: 0.92 | "NEFT daily limit: ₹20 lakh..."   │
+│ Score: 0.85 | "NEFT transaction charges: Free..." │
+│ Score: 0.78 | "NEFT processing times: 30 mins..." │
+└──────────────────────────────────────────────────┘
+        │
+        ▼  Step 4: These become the context in the prompt
+```
+
+### Why top-3 and not top-10?
+```yaml
+rag:
+  top-k-documents: 3
+```
+
+More documents = more tokens = higher cost + slower response + potential noise. 3 is the sweet spot for focused banking queries. For complex research, you'd increase this.
+
+---
+
+## 11. Redis — Conversation Memory <a name="redis"></a>
+
+### Why memory is essential for chatbots
+```
+❌ Without Redis (stateless):
+Turn 1 - User: "I want to transfer money"
+Turn 1 - Bot:  "How much and to which account?"
+Turn 2 - User: "₹50,000 to savings account"
+Turn 2 - Bot:  "I don't know what you're referring to." ← CONTEXT LOST
+
+✅ With Redis (stateful):
+Turn 2 - Bot retrieves history from Redis
+Bot knows: user wants to transfer ₹50,000 to savings
+Bot:  "Initiating ₹50,000 transfer to your savings account."
+```
+
+### Why Redis specifically (not MySQL)?
+```
+MySQL read latency:   ~5-50ms  (disk I/O, SQL parsing)
+Redis read latency:   ~0.1ms   (pure in-memory, O(1) lookup)
+```
+
+For a chatbot handling 100+ concurrent users, each needing 10 history messages, Redis keeps response time in milliseconds.
+
+### How conversation history is used in the prompt
+```
+System Prompt: "You are a banking assistant..."
+
+Chat History (from Redis):
+  User: I want to transfer money
+  Assistant: How much and to which account?
+
+Retrieved Context (from Pinecone):
+  NEFT limit is ₹20 lakh...
+
+Current Query:
+  "₹50,000 to savings account"
+```
+
+This entire block is what gets sent to Gemini.
+
+### TTL strategy
+```yaml
+session-ttl-minutes: 30
+max-history-messages: 10
+```
+
+Sessions expire after 30 minutes of inactivity — saves Redis memory. Only last 10 messages are sent — prevents prompt from growing too large.
+
+---
+
+## 12. Prompt Engineering <a name="prompt-engineering"></a>
+
+### What is prompt engineering?
+It's the art of crafting instructions that guide the LLM to produce accurate, safe, and relevant responses. For banking, this is critical — wrong answers could cause financial harm.
+
+### Your system prompt template (`system-prompt.st`)
+```
+You are CitiCore Banking's AI assistant.
+
+STRICT RULES:
+1. Answer ONLY based on the provided context documents
+2. If information is not in the context, say "I don't have that information"
+3. Never make up account numbers, limits, or policies
+4. Always recommend calling 1800-XXX-XXXX for urgent matters
+
+CUSTOMER: {customer_name} (ID: {auth_user_id})
+
+BANKING KNOWLEDGE BASE:
+{retrieved_context}
+
+LIVE ACCOUNT DATA:
+{account_context}
+
+CONVERSATION HISTORY:
+{chat_history}
+```
+
+### Why each part matters
+| Part | Why |
+|---|---|
+| Role definition | Sets tone and persona |
+| Strict rules | Prevents hallucination |
+| Customer name | Personalization |
+| Retrieved context | Grounds answer in real policy |
+| Account context | Enables account-specific answers |
+| Chat history | Enables multi-turn conversation |
+
+### Prompt engineering techniques used
+```
+1. Role prompting:    "You are a banking assistant"
+2. Constraint prompting: "Answer ONLY from provided documents"
+3. Few-shot examples: (can be added for edge cases)
+4. Chain-of-thought:  "First identify intent, then find relevant policy..."
+5. Fallback instruction: "If unsure, recommend calling support"
+```
+
+---
+
+## 13. Hallucination <a name="hallucination"></a>
+
+### What is hallucination?
+An LLM "hallucination" is when the model confidently generates incorrect information that sounds plausible.
+
+### Banking example
+```
+❌ Without RAG (LLM guesses):
+User: "What is CitiCore's NEFT daily limit?"
+Gemini (no context): "CitiCore's NEFT daily limit is ₹2 lakh per day."
+                      ← This is MADE UP. Could cause real financial harm.
+
+✅ With RAG (grounded in your documents):
+Retrieved: "CitiCore NEFT daily limit: ₹20,00,000"
+Gemini: "According to CitiCore's policy, your NEFT daily limit is ₹20 lakh."
+```
+
+### Three layers of hallucination prevention in this project
+```
+Layer 1: RAG           → inject real documents into prompt
+Layer 2: Prompt rules  → "Answer ONLY from provided context"
+Layer 3: Threshold     → similarity > 0.70 (no weak matches)
+```
+
+---
+
+## 14. Intent Detection <a name="intent-detection"></a>
+
+### What it is
+Intent detection classifies the user's purpose before processing the message, enabling intelligent routing.
+
+### Intent routing in your project
+```
+User Query                              Intent          Action
+─────────────────────────────────────────────────────────────────
+"What is my balance?"              →   BALANCE    →   Fetch live account data
+"Transfer ₹500 to John"            →   TRANSFER   →   Fetch account + limits
+"What is NEFT?"                    →   FAQ        →   RAG only
+"Apply for home loan"              →   LOAN       →   RAG + loan service API
+"My credit card bill is due"       →   CREDIT_CARD →  RAG + account context
+```
+
+### Why intent detection matters for performance
+```java
+// Only call live account API if the intent needs it — saves latency
+if (intentService.requiresLiveAccountData(intent)) {
+    accountContext = accountContextService.fetchAccountContext(userId, token);
+}
+```
+
+Without this, you'd call the account service for every single FAQ question unnecessarily.
+
+### Rule-based vs ML-based intent detection
+| Approach | Pros | Cons |
+|---|---|---|
+| Rule-based (this project) | Fast, predictable, no training needed | Brittle, misses edge cases |
+| ML classifier | Handles nuance, learns from data | Needs labeled data, overhead |
+| LLM-based | Most flexible | Slower, more expensive per call |
+
+---
+
+## 15. Kafka — Event Streaming <a name="kafka"></a>
+
+### Why Kafka in an AI chatbot?
+The chatbot's job is to answer questions — not to update dashboards, train models, or generate reports. Kafka decouples these concerns via async event streaming.
+
+### Event published per chat message
+```java
+ChatAnalyticsEvent {
+    eventType:    "CHAT_MESSAGE_SENT",
+    sessionId:    "4a15e80d-...",
+    authUserId:   12345,
+    intent:       "TRANSFER",
+    tokensUsed:   847,
+    ragUsed:      true,
+    ragDocCount:  3,
+    modelUsed:    "gemini-2.0-flash",
+    responseTimeMs: 1240,
+    timestamp:    "2026-06-02T19:02:16"
+}
+```
+
+### What downstream consumers can do with this
+```
+Kafka Topic: citicore.chat.analytics
+        │
+        ├──► Analytics Service
+        │         │ Daily active users, popular questions, intent breakdown
+        │
+        ├──► Model Monitoring Service
+        │         │ Avg token usage, response times, RAG hit rates
+        │
+        ├──► Compliance Service
+        │         │ Audit trail, sensitive query flagging
+        │
+        └──► ML Training Pipeline
+                  │ Collect Q&A pairs for fine-tuning future models
+```
+
+### Kafka vs direct DB write
+```
+❌ Direct write (blocking):
+Chatbot → saves to MySQL → responds to user
+         (user waits for DB write to complete)
+
+✅ Kafka (non-blocking):
+Chatbot → respond to user immediately
+        → fire-and-forget Kafka event
+        → consumer writes to DB asynchronously
+```
+
+---
+
+## 16. Complete Query Lifecycle <a name="query-lifecycle"></a>
+
+```
+Customer: "What is the NEFT transfer limit?"
+
+Step 1:  HTTP POST /api/chat/message
+         ChatController.chat() called
+
+Step 2:  JWT validated → authUserId extracted
+
+Step 3:  Session retrieved or created (MySQL)
+
+Step 4:  IntentService.detect("What is the NEFT transfer limit?")
+         → Intent: "TRANSFER"
+
+Step 5:  requiresLiveAccountData("TRANSFER") → true
+         → AccountContextService calls account-service:8084
+         → Returns: { balance: ₹1,50,000, accountType: SAVINGS }
+
+Step 6:  RagService.retrieve("What is the NEFT transfer limit?")
+         → EmbeddingModel embeds query → 768-dim vector
+         → Pinecone similarity search (cosine, top-3, threshold 0.70)
+         → Returns 3 banking policy chunks
+
+Step 7:  ConversationMemoryService.formatHistoryForPrompt(sessionId)
+         → Fetches last 10 messages from Redis
+
+Step 8:  buildSystemPrompt(context, accountData, history, name, userId)
+         → Assembles full prompt string
+
+Step 9:  chatClient.prompt().system(systemPrompt).user(query).call()
+         → POST to Gemini via OpenAI-compatible endpoint
+         → Gemini generates response
+         → tokensUsed = 847
+
+Step 10: ChatMessage saved to MySQL (user + assistant messages)
+         Conversation updated in Redis
+
+Step 11: kafkaService.publishChatEvent(analyticsEvent)
+         → Published to citicore.chat.analytics
+
+Step 12: ChatResponse returned to customer
+         {
+           sessionId: "4a15e80d...",
+           assistantResponse: "CitiCore's NEFT daily limit is ₹20 lakh...",
+           intent: "TRANSFER",
+           ragSourceDocuments: ["banking-faq.txt"],
+           tokensUsed: 847,
+           modelUsed: "gemini-2.0-flash"
+         }
+
+Total latency: ~1200-2000ms
+```
+
+---
+
+## 17. Interview Questions & Answers <a name="interview-qa"></a>
+
+### Core AI/ML Questions
+
+**Q: What is RAG and why did you use it?**
+> RAG (Retrieval Augmented Generation) solves the hallucination problem for domain-specific applications. LLMs are trained on generic internet data and don't know our bank's specific policies. By retrieving relevant policy documents from Pinecone at query time and injecting them into the prompt, we ground the LLM's response in actual facts. Without RAG, the model might quote wrong transfer limits, causing real financial harm.
+
+**Q: How does vector similarity search work?**
+> Text is converted to high-dimensional vectors (embeddings) that capture semantic meaning. Similar concepts produce mathematically nearby vectors. We use cosine similarity — measuring the angle between two vectors — to find the most semantically relevant documents. A score of 1.0 means identical meaning; we use 0.70 as our threshold to filter out weak matches.
+
+**Q: What is the difference between a vector database and a relational database?**
+> A relational database stores structured data and supports exact/keyword matching via SQL. A vector database stores dense numerical representations of unstructured data and supports semantic (meaning-based) search. MySQL can't find that "remittance" and "NEFT transfer" are the same concept — Pinecone can, because their vectors are nearby.
+
+**Q: Why Redis for conversation memory instead of MySQL?**
+> Conversation history is read on every single chat message. Redis provides sub-millisecond read latency since it's pure in-memory, vs 5-50ms for MySQL with disk I/O. For a chatbot with 100 concurrent users each needing 10 messages of history, Redis keeps response times fast. The data is also ephemeral — sessions expire after 30 minutes — which matches Redis's TTL feature perfectly.
+
+**Q: How do you prevent hallucination?**
+> Three layers: (1) RAG — inject real documents so the model has accurate source material. (2) System prompt constraints — explicit instructions like "Answer ONLY from provided context, never make up information." (3) Similarity threshold — only inject documents with score > 0.70 so we don't accidentally provide weakly-related or misleading context.
+
+**Q: What is an embedding and why is dimension count important?**
+> An embedding is a dense vector representation of text that captures semantic meaning. The dimension count (768 for text-embedding-004, 1536 for text-embedding-3-small) must exactly match the Pinecone index configuration. A mismatch causes a runtime crash because Pinecone expects vectors of a specific shape for its ANN (Approximate Nearest Neighbor) index to work correctly.
+
+**Q: Why Kafka for analytics instead of a direct database write?**
+> The chatbot's critical path is: receive query → generate response → return to user. Analytics are important but not urgent. Using Kafka decouples the critical path from analytics storage. The chatbot publishes a fire-and-forget event and immediately responds to the user, while downstream consumers handle persistence, monitoring, and reporting asynchronously. This reduces latency and increases resilience — if the analytics service is down, the chatbot still works.
+
+**Q: What is chunking and why is chunk overlap needed?**
+> Chunking splits large documents into smaller pieces so only the relevant chunk (not the whole PDF) is injected into the prompt. Chunk overlap (50 chars in our case) preserves context at chunk boundaries — without it, a sentence split across two chunks loses meaning at the split point.
+
+**Q: What is the OpenAI-compatible Gemini endpoint trick you used?**
+> Google Gemini exposes a REST API at `generativelanguage.googleapis.com/v1beta/openai` that accepts requests in OpenAI's format and returns responses in OpenAI's format. By pointing Spring AI's OpenAI client at this base URL, we get Gemini's capabilities (free tier, fast) while using the OpenAI client we already have in Spring AI. No custom Gemini client needed.
+
+---
+
+## 18. What to Learn Next <a name="next-steps"></a>
+
+Based on your 2.5 YOE and this project, these are the high-value topics for AI engineering interviews:
+
+### 1. AI Agents & Tool/Function Calling
+LLMs that can call external tools autonomously.
+```
+User: "Transfer ₹500 to John"
+Agent: calls transfer_money(amount=500, recipient="John") tool
+Agent: "Transfer successful. Reference: TXN123456"
+```
+
+### 2. MCP — Model Context Protocol
+Anthropic's standard for connecting AI models to data sources and tools. Think of it as USB-C for AI integrations. Increasingly expected in AI engineer interviews.
+
+### 3. Multi-Agent Architecture
+Multiple specialized agents collaborating:
+```
+OrchestratorAgent
+    ├── AccountAgent    (handles balance, transactions)
+    ├── LoanAgent       (handles loan queries)
+    └── ComplianceAgent (flags suspicious requests)
+```
+
+### 4. Guardrails & AI Safety
+Input/output filtering to prevent prompt injection, PII leakage, jailbreaks. Libraries: Guardrails AI, NeMo Guardrails.
+
+### 5. Fine-tuning vs RAG
+When to fine-tune a model vs using RAG. (Interview question: RAG is for factual retrieval; fine-tuning is for style/behavior changes.)
+
+### 6. Evaluation (LLM Evals)
+How to measure AI quality: RAGAS framework for RAG evaluation (faithfulness, context precision, answer relevance).
+
+### 7. LangChain4j (Java alternative to Spring AI)
+Some companies use LangChain4j — understanding both shows breadth.
+
+---
+
+## Quick Reference Card
+
+```
+Concept          | What it does                      | Your tool
+─────────────────────────────────────────────────────────────────
+LLM              | Understands & generates language  | Gemini 2.0 Flash
+Spring AI        | Java SDK for LLMs                 | ChatClient, EmbeddingModel
+RAG              | Inject real docs into prompt      | RagService
+Chunking         | Split PDFs into small pieces      | TextSplitter (500 chars)
+Embedding        | Text → vector numbers             | text-embedding-004 (768-dim)
+Vector DB        | Store & search vectors            | Pinecone
+Similarity       | How "close" two vectors are       | Cosine similarity (>0.70)
+Memory           | Remember conversation context     | Redis (30min TTL)
+Prompt Eng.      | Craft instructions for LLM        | system-prompt.st template
+Intent           | Classify user purpose             | IntentService
+Kafka            | Async event streaming             | Analytics, audit, monitoring
+Hallucination    | LLM makes up wrong facts          | Prevented by RAG + prompts
+```
+
+---
+
+*Built with Spring Boot 3.3.2 · Spring AI 1.1.7 · Gemini 2.0 Flash · Pinecone · Redis · Kafka*  
+*Architecture pattern: RAG + Conversation Memory + Intent Routing + Event Streaming*
+
+
