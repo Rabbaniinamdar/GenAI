@@ -1751,8 +1751,1302 @@ Hallucination    | LLM makes up wrong facts          | Prevented by RAG + prompt
 ```
 
 ---
+# 🏦 CitiCore Banking — AI Customer Support Chatbot
 
-*Built with Spring Boot 3.3.2 · Spring AI 1.1.7 · Gemini 2.0 Flash · Pinecone · Redis · Kafka*  
-*Architecture pattern: RAG + Conversation Memory + Intent Routing + Event Streaming*
+> **Full-stack GenAI microservice** built with Spring Boot 3.2, Spring AI, GPT-4o, Pinecone, Redis, Kafka, and deployed to AWS via Jenkins CI/CD.
+>
+> 📌 *This README is structured as interview preparation notes for a developer with 2.5 YOE entering the GenAI space.*
+
+---
+
+## 📑 Table of Contents
+
+1. [Project Overview](#-project-overview)
+2. [Architecture](#-architecture)
+3. [Tech Stack](#-tech-stack)
+4. [API Endpoints](#-api-endpoints)
+5. [GenAI Concepts — Deep Dive](#-genai-concepts--deep-dive)
+   - [Spring AI](#1-spring-ai)
+   - [LLM — Large Language Model](#2-llm--large-language-model)
+   - [Transformer Architecture](#3-transformer-architecture)
+   - [Tokenization](#4-tokenization)
+   - [Embeddings](#5-embeddings)
+   - [Vectors & Vector Space](#6-vectors--vector-space)
+   - [Vector Database (Pinecone)](#7-vector-database-pinecone)
+   - [Chunking](#8-chunking)
+   - [RAG — Retrieval Augmented Generation](#9-rag--retrieval-augmented-generation)
+   - [Prompt Engineering](#10-prompt-engineering)
+   - [Hallucination](#11-hallucination)
+   - [Fine-Tuning](#12-fine-tuning)
+   - [Context Window](#13-context-window)
+   - [Temperature & Sampling](#14-temperature--sampling)
+   - [Cosine Similarity](#15-cosine-similarity)
+   - [Attention Mechanism](#16-attention-mechanism)
+   - [Zero-Shot, One-Shot, Few-Shot](#17-zero-shot-one-shot-few-shot-prompting)
+   - [Chain of Thought](#18-chain-of-thought-cot)
+   - [Semantic Search vs Keyword Search](#19-semantic-search-vs-keyword-search)
+6. [How All Concepts Work Together (Full Flow)](#-how-all-concepts-work-together)
+7. [Setup & Running Locally](#-setup--running-locally)
+8. [CI/CD Pipeline](#-cicd-pipeline)
+9. [Interview Q&A](#-interview-qa)
+
+---
+
+## 🏗 Project Overview
+
+CitiCore Chatbot is an **AI-powered customer support chatbot** for a banking platform. It can:
+
+- Answer banking FAQs (NEFT/IMPS limits, KYC process, account types)
+- Fetch and explain a user's **live account balance and transactions**
+- Calculate **loan EMI** and explain eligibility
+- Provide **branch and IFSC information**
+- Maintain **conversation history** across messages
+
+**What makes it intelligent:**
+> Instead of hard-coded rules, the chatbot uses GPT-4o combined with **RAG (Retrieval Augmented Generation)** — it retrieves real CitiCore banking policy documents and injects them into the prompt. This means answers are always **accurate to CitiCore's actual policies**, not GPT-4o's training data.
+
+---
+
+## 🏛 Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     CLIENT (Angular / Mobile)                    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ POST /api/v1/chatbot/chat
+                             │ Authorization: Bearer JWT
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    CHATBOT SERVICE  :8086                        │
+│                                                                  │
+│  1. JWT Auth          → validate token (same secret as auth-svc) │
+│  2. Intent Detection  → classify: FAQ / ACCOUNT / LOAN / BRANCH  │
+│  3. Redis             → load last 10 messages (conversation mem) │
+│  4. RAG Pipeline:                                                 │
+│     a. Embed query    → OpenAI text-embedding-3-small (1536-dim) │
+│     b. Pinecone search→ top-3 similar knowledge chunks           │
+│     c. Format context → inject into system prompt                │
+│  5. Account Context   → HTTP call to account-service (if needed)  │
+│  6. GPT-4o call       → Spring AI ChatClient                     │
+│  7. Save to Redis     → update conversation history              │
+│  8. Save to MySQL     → persistent chat log                      │
+│  9. Kafka event       → analytics topic                          │
+└─────────────────────────────────────────────────────────────────┘
+         │                    │                        │
+         ▼                    ▼                        ▼
+   ┌──────────┐        ┌──────────────┐        ┌──────────────┐
+   │  Redis   │        │   Pinecone   │        │    GPT-4o    │
+   │ (memory) │        │ (Vector DB)  │        │ (OpenAI API) │
+   └──────────┘        └──────────────┘        └──────────────┘
+         │                    ▲
+         │                    │ upsert on startup
+         ▼                    │
+   ┌──────────┐        ┌──────────────────────────────────────────┐
+   │  MySQL   │        │         Knowledge Base (.txt files)      │
+   │ (history)│        │  banking-faq.txt / loan-eligibility.txt  │
+   └──────────┘        └──────────────────────────────────────────┘
+```
+
+---
+
+## 🛠 Tech Stack
+
+| Category | Technology | Why |
+|---|---|---|
+| Framework | Spring Boot 3.2 | Production-grade Java microservice |
+| AI Framework | Spring AI 1.0.0 | Abstracts LLM + Vector Store APIs |
+| LLM | GPT-4o (OpenAI) | Best reasoning, large context window |
+| Embeddings | text-embedding-3-small | 1536-dim, cheap, accurate semantic search |
+| Vector DB | Pinecone | Managed, free tier, fast ANN search |
+| Conversation Memory | Redis | Sub-millisecond, TTL-based session cache |
+| Chat Persistence | MySQL | Permanent conversation history |
+| Async Events | Apache Kafka | Non-blocking analytics |
+| Auth | JWT (jjwt 0.12) | Stateless, shared secret with auth-service |
+| CI/CD | Jenkins + Docker Hub | Build → push image → deploy to EC2 |
+| Cloud | AWS EC2 | Container hosting |
+
+---
+
+## 🔗 API Endpoints
+
+| Method | URL | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/chatbot/chat` | CUSTOMER | Send message, get AI response |
+| `GET` | `/api/v1/chatbot/sessions/{userId}` | CUSTOMER | List all sessions |
+| `GET` | `/api/v1/chatbot/sessions/{id}/messages` | CUSTOMER | Full chat history |
+| `DELETE` | `/api/v1/chatbot/sessions/{id}` | CUSTOMER | End session + clear Redis |
+| `POST` | `/api/v1/chatbot/admin/reload-knowledge-base` | ADMIN | Re-embed docs into Pinecone |
+| `GET` | `/api/v1/chatbot/health` | Public | Health check |
+
+---
+
+## 🧠 GenAI Concepts — Deep Dive
+
+---
+
+### 1. Spring AI
+
+**What is it?**
+Spring AI is a framework from the Spring team (like Spring Boot, Spring Security) that provides a unified abstraction layer over multiple AI providers — OpenAI, Anthropic Claude, Google Gemini, Ollama, Mistral, etc.
+
+**Why use it instead of calling OpenAI directly?**
+Without Spring AI you'd write raw HTTP calls:
+```java
+// Without Spring AI — messy, vendor-locked
+HttpClient client = HttpClient.newHttpClient();
+String body = """
+    {"model":"gpt-4o","messages":[{"role":"user","content":"%s"}]}
+""".formatted(message);
+HttpRequest req = HttpRequest.newBuilder()
+    .uri(URI.create("https://api.openai.com/v1/chat/completions"))
+    .header("Authorization", "Bearer " + apiKey)
+    .POST(BodyPublishers.ofString(body))
+    .build();
+// parse JSON manually...
+```
+
+With Spring AI:
+```java
+// With Spring AI — clean, provider-agnostic
+@Autowired ChatClient chatClient;
+
+String response = chatClient
+    .prompt()
+    .system("You are a banking assistant")
+    .user(message)
+    .call()
+    .content();
+// Switch LLM by changing ONE line in application.yml
+```
+
+**Spring AI key abstractions:**
+
+| Interface | Purpose | Implementations |
+|---|---|---|
+| `ChatClient` | High-level LLM conversation API | OpenAI, Anthropic, Gemini, Ollama |
+| `ChatModel` | Low-level LLM API | OpenAI, Anthropic, Gemini |
+| `EmbeddingModel` | Convert text → vectors | OpenAI, Cohere, Gemini |
+| `VectorStore` | Store & search embeddings | Pinecone, pgvector, Weaviate, Chroma |
+| `DocumentReader` | Read & parse documents | PDF, Text, JSON, HTML |
+
+**How we configured it in `AiConfig.java`:**
+```java
+@Bean
+public ChatClient chatClient(ChatModel chatModel) {
+    // chatModel is auto-created from application.yml settings
+    return ChatClient.builder(chatModel).build();
+}
+
+@Bean
+public EmbeddingModel openAiEmbeddingModel() {
+    OpenAiApi api = OpenAiApi.builder()
+        .apiKey(openAiApiKey)
+        .build();
+    return new OpenAiEmbeddingModel(api,
+        OpenAiEmbeddingOptions.builder()
+            .model("text-embedding-3-small")
+            .build());
+}
+```
+
+**`application.yml` for Spring AI:**
+```yaml
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o
+          temperature: 0.3
+          max-tokens: 1024
+      embedding:
+        options:
+          model: text-embedding-3-small
+```
+
+---
+
+### 2. LLM — Large Language Model
+
+**What is it?**
+An LLM is a deep learning model trained on massive amounts of text (billions of documents — websites, books, code, articles). It learns statistical patterns between words and can generate human-like text.
+
+**How does it work at a high level?**
+```
+Input:  "What is the capital of France?"
+LLM:    [processes tokens through transformer layers]
+Output: "The capital of France is Paris."
+```
+
+The LLM doesn't "know" facts — it generates the **most statistically likely** continuation of your input based on training data.
+
+**Key LLMs in the market (2024):**
+
+| Model | Company | Context Window | Best For |
+|---|---|---|---|
+| GPT-4o | OpenAI | 128K tokens | General, coding, reasoning |
+| GPT-4o-mini | OpenAI | 128K tokens | Fast, cheap, good quality |
+| Claude 3.5 Sonnet | Anthropic | 200K tokens | Long documents, analysis |
+| Gemini 1.5 Flash | Google | 1M tokens | Very long context, free tier |
+| Llama 3.1 | Meta | 128K tokens | Open source, self-hosted |
+
+**Why GPT-4o for CitiCore chatbot?**
+- Best reasoning ability for complex banking questions
+- Handles follow-up questions naturally (good conversation memory)
+- 128K context window — can hold entire conversation history
+- Reliable structured output (important for banking accuracy)
+
+**How GPT-4o is used in our code:**
+```java
+// In ChatService.java
+ChatResponse aiResponse = chatClient
+    .prompt()
+    .system(systemPrompt)      // Role + context + RAG docs
+    .user(request.getMessage()) // User's question
+    .call()
+    .chatResponse();
+
+String answer = aiResponse.getResult().getOutput().getContent();
+int tokensUsed = aiResponse.getMetadata().getUsage().getTotalTokens();
+```
+
+**Interview tip:** The difference between GPT-4 and GPT-4o:
+- GPT-4o = "omni" — handles text, images, audio natively in one model
+- Faster and cheaper than GPT-4 Turbo
+- Same intelligence level
+
+---
+
+### 3. Transformer Architecture
+
+**What is it?**
+Transformer is the neural network architecture that powers ALL modern LLMs (GPT-4, Claude, Gemini, Llama). Introduced by Google in the 2017 paper *"Attention Is All You Need"*.
+
+**Before Transformers:** RNNs (Recurrent Neural Networks) processed text word-by-word in sequence — slow, forgot long-range dependencies.
+
+**Key innovation: Self-Attention**
+Transformers process ALL tokens simultaneously and learn which tokens should "pay attention" to which other tokens.
+
+```
+Sentence: "The bank by the river had high interest rates"
+
+Without attention:  model might confuse "bank" = financial or river bank
+With self-attention: "bank" attends to "interest rates" → financial bank
+                     "bank" attends to "river" → river bank (if that context)
+```
+
+**Transformer architecture (simplified):**
+```
+Input Tokens → Embedding → [Attention Layer × N] → Output Tokens
+                                ↕
+                    Each layer refines understanding
+                    GPT-4 has ~96 attention layers
+```
+
+**What this means practically:**
+- Transformers can handle very long inputs
+- They understand context across the entire input
+- They generate responses token-by-token (autoregressive)
+- More layers = deeper understanding = smarter model = higher cost
+
+**In our project:** We don't implement Transformers — we consume them via the OpenAI API. But understanding the architecture helps explain WHY:
+- Longer prompts cost more tokens
+- Context window limits exist (128K for GPT-4o)
+- The model understands intent, not just keywords
+
+---
+
+### 4. Tokenization
+
+**What is it?**
+Before an LLM processes text, it converts text into **tokens** — small units the model understands. A token is approximately 3-4 characters or ¾ of a word.
+
+**Example:**
+```
+"CitiCore Banking Assistant" → ["Citi", "Core", " Banking", " Assistant"]
+                                  4 tokens
+
+"What is my NEFT limit?" → ["What", " is", " my", " N", "EFT", " limit", "?"]
+                              7 tokens
+```
+
+**Why tokenization matters:**
+1. **Cost:** OpenAI charges per token (input + output). 1M input tokens = ~$2.50 for GPT-4o
+2. **Context window:** GPT-4o allows 128,000 tokens max per request
+3. **Speed:** More tokens = slower response
+
+**Token counting in our project:**
+```java
+// In ChatService.java — we track tokens for analytics
+int tokensUsed = aiResponse.getMetadata()
+                            .getUsage()
+                            .getTotalTokens();
+// Stored in MySQL chat_messages.tokens_used
+// Published to Kafka for usage analytics
+```
+
+**Rule of thumb:**
+```
+1 token  ≈ 4 characters
+1 token  ≈ ¾ of a word
+100 tokens ≈ 75 words
+1 page of text ≈ 500 tokens
+```
+
+**Why we use Redis for conversation history:**
+Every message we send to GPT-4o must include the full conversation history (GPT-4o has no memory). If a user sends 20 messages at ~100 tokens each = 2000 tokens just for history. Redis lets us load this in <1ms vs 20-50ms from MySQL.
+
+---
+
+### 5. Embeddings
+
+**What is it?**
+An embedding is the conversion of text into a **dense numerical vector** (list of floating point numbers) that encodes **semantic meaning**. Similar meaning = similar vectors.
+
+**Visual intuition:**
+```
+"What is minimum balance?"     → [0.12, -0.83, 0.45, 0.71, ... 1536 numbers]
+"How much must I keep in acc?" → [0.11, -0.81, 0.44, 0.73, ... 1536 numbers]
+                                   ↑ Almost identical! Same meaning, different words
+
+"What is the weather today?"   → [0.89,  0.23, -0.67, -0.12, ... 1536 numbers]
+                                   ↑ Very different! Unrelated topic
+```
+
+**Why 1536 dimensions (text-embedding-3-small)?**
+More dimensions = more nuance captured. But more dimensions = more storage + slower search.
+
+| Model | Dimensions | Use Case |
+|---|---|---|
+| text-embedding-3-small | 1536 | Good balance — we use this |
+| text-embedding-3-large | 3072 | Maximum accuracy, 2x cost |
+| text-embedding-ada-002 | 1536 | Older model, still widely used |
+| Google text-embedding-004 | 768 | Free, good for Gemini stack |
+
+**How we generate embeddings in our project:**
+```java
+// In KnowledgeBaseService.java
+// Spring AI calls text-embedding-3-small API automatically
+// when you call vectorStore.add(documents)
+
+List<Document> documents = chunks.stream()
+    .map(chunk -> new Document(chunk, metadata))
+    .collect(toList());
+
+vectorStore.add(documents);
+// ↑ Internally this calls:
+//   1. embeddingModel.embed(chunk) → float[1536]
+//   2. pineconeClient.upsert(id, vector, metadata)
+```
+
+**Interview tip:** The difference between embeddings and encodings:
+- **Encoding**: lossless, exact representation (Base64, UTF-8)
+- **Embedding**: lossy, semantic representation (captures meaning, loses exact words)
+
+---
+
+### 6. Vectors & Vector Space
+
+**What is it?**
+A vector is simply an ordered list of numbers: `[0.12, -0.83, 0.45, ...]`
+
+In the context of AI, embedding vectors represent points in a **high-dimensional space** where the **distance between points = semantic similarity**.
+
+**2D analogy (imagine 2D instead of 1536D):**
+```
+           Banking axis →
+    ↑  1.0 │ "interest rate"  "EMI"
+    │  0.8 │          "loan"
+    │  0.5 │  "savings"
+Finance    │  0.2 │
+axis  0.0 ──┼──────────────────────
+    │ -0.2 │
+    │ -0.5 │              "pizza"
+    ▼ -1.0 │  "weather"      "movie"
+
+Banking-related terms cluster together!
+Unrelated terms are far away.
+```
+
+**Key vector operations used in our RAG pipeline:**
+
+```
+Cosine Similarity = cos(θ) = (A · B) / (|A| × |B|)
+
+Result: value between -1 and 1
+  1.0  = identical meaning
+  0.8+ = very similar (good RAG match)
+  0.5  = somewhat related
+  0.0  = completely unrelated
+ -1.0  = opposite meaning
+```
+
+**In our code (Pinecone does this automatically):**
+```java
+// RagService.java
+List<Document> results = vectorStore.similaritySearch(
+    SearchRequest.query(userQuery)
+        .withTopK(3)                   // return top 3 similar docs
+        .withSimilarityThreshold(0.70)  // minimum 70% similarity
+);
+// Pinecone embeds the query, then finds vectors closest by cosine similarity
+```
+
+---
+
+### 7. Vector Database (Pinecone)
+
+**What is it?**
+A Vector Database is a specialized database optimized for storing, indexing, and searching high-dimensional vectors using Approximate Nearest Neighbor (ANN) algorithms. It's much faster than brute-force comparison.
+
+**Why not just use MySQL for vectors?**
+
+| | MySQL | Pinecone |
+|---|---|---|
+| Storage | Rows & columns | Vectors + metadata |
+| Search | Exact match / LIKE | Semantic similarity |
+| Query type | `WHERE name = 'NEFT'` | "find similar meaning" |
+| 1M vector search | Minutes | Milliseconds |
+| Index type | B-Tree | HNSW (graph-based ANN) |
+
+**HNSW — Hierarchical Navigable Small World:**
+The algorithm Pinecone uses internally. It builds a multi-layer graph of vectors where:
+- Top layers: few nodes, long-range connections (fast navigation)
+- Bottom layers: all nodes, short-range connections (precise search)
+
+Like navigating a city: start with highways (fast, coarse), zoom into local streets (slow, precise).
+
+**Pinecone key concepts:**
+
+| Term | Meaning |
+|---|---|
+| Index | The "database" that holds vectors (like a table) |
+| Namespace | Partition within an index (like a folder) |
+| Upsert | Insert or update a vector |
+| Query | Search for nearest neighbors |
+| Metadata | JSON data stored alongside each vector |
+| Top-K | Number of nearest neighbors to return |
+
+**Our Pinecone setup:**
+```yaml
+# application.yml
+spring:
+  ai:
+    vectorstore:
+      pinecone:
+        api-key: ${PINECONE_API_KEY}
+        index-name: citicore-knowledge-base
+        namespace: banking-docs
+        content-field-name: text
+        distance-type: cosine      # cosine similarity
+
+# IMPORTANT: Index must be created with dims=1536 (text-embedding-3-small)
+# Pinecone Dashboard → Create Index → Dimensions: 1536, Metric: cosine
+```
+
+**AiConfig.java — our Pinecone setup:**
+```java
+@Bean
+@Primary
+public VectorStore vectorStore(
+        EmbeddingModel embeddingModel,
+        @Value("${spring.ai.vectorstore.pinecone.api-key}") String apiKey,
+        @Value("${spring.ai.vectorstore.pinecone.index-name}") String indexName,
+        @Value("${spring.ai.vectorstore.pinecone.namespace}") String namespace,
+        @Value("${spring.ai.vectorstore.pinecone.content-field-name}") String contentField
+) {
+    return PineconeVectorStore.builder()
+            .apiKey(apiKey)
+            .indexName(indexName)
+            .namespace(namespace)
+            .contentFieldName(contentField)
+            .embeddingModel(embeddingModel)
+            .build();
+}
+```
+
+---
+
+### 8. Chunking
+
+**What is it?**
+Chunking is the process of splitting large documents into smaller pieces before embedding them into a vector database.
+
+**Why is chunking necessary?**
+
+1. **Embedding quality degrades with length:** A 10-page document embedded as one vector captures too many topics. A focused 500-character paragraph captures one topic well.
+
+2. **Retrieval precision:** If a user asks "What is NEFT limit?", we want to retrieve the 2-3 paragraphs about NEFT — not the entire banking FAQ document.
+
+3. **Context window limits:** We can't inject the entire knowledge base into the prompt — we pick only the most relevant 3 chunks.
+
+**Chunking strategies:**
+
+| Strategy | How | When to use |
+|---|---|---|
+| Fixed-size | Split every N characters | Simple, fast — we use this |
+| Sentence | Split at sentence boundaries | When sentence integrity matters |
+| Paragraph | Split at `\n\n` | Documents with clear paragraphs |
+| Semantic | Use AI to find topic boundaries | Most accurate, expensive |
+| Recursive | Try paragraph → sentence → word | LangChain's default |
+
+**Our implementation in `KnowledgeBaseService.java`:**
+```java
+private List<String> splitIntoChunks(String text, int size, int overlap) {
+    List<String> chunks = new ArrayList<>();
+    int start = 0;
+
+    while (start < text.length()) {
+        int end = Math.min(start + size, text.length());
+
+        // Smart: try to break at paragraph or sentence boundary
+        if (end < text.length()) {
+            int newline = text.lastIndexOf('\n', end);
+            int period  = text.lastIndexOf('. ', end);
+            int breakAt = Math.max(newline, period);
+            if (breakAt > start + size / 2) {
+                end = breakAt + 1;
+            }
+        }
+
+        chunks.add(text.substring(start, end).trim());
+        start = end - overlap; // ← overlap preserves context at boundaries
+    }
+    return chunks;
+}
+```
+
+**Chunk overlap explained:**
+```
+Without overlap:
+  Chunk 1: "...The NEFT limit is ₹10 lakh per transaction. Daily"
+  Chunk 2: "limit is ₹20 lakh. This applies to all customers..."
+  → "Daily limit" sentence is split — context lost!
+
+With 50-char overlap:
+  Chunk 1: "...The NEFT limit is ₹10 lakh per transaction. Daily"
+  Chunk 2: "transaction. Daily limit is ₹20 lakh. This applies..."
+  → "Daily limit" context preserved in both chunks ✅
+```
+
+**Our config:**
+```yaml
+chatbot:
+  knowledge-base:
+    chunk-size: 500     # 500 characters per chunk
+    chunk-overlap: 50   # 50 character overlap between chunks
+```
+
+---
+
+### 9. RAG — Retrieval Augmented Generation
+
+**What is it?**
+RAG is an architecture pattern that combines:
+- **R**etrieval: find relevant documents from a knowledge base
+- **A**ugmented: inject those documents into the prompt
+- **G**eneration: LLM generates a response using that context
+
+It solves the biggest problem with LLMs: **they can only answer based on their training data** (which has a cutoff date and doesn't include YOUR company's internal policies).
+
+**The RAG pipeline in full detail:**
+
+```
+INDEXING PHASE (runs at startup):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+banking-faq.txt
+    │
+    ▼
+[Chunker] → 500-char chunks with 50-char overlap
+    │
+    ▼ for each chunk
+[text-embedding-3-small] → float[1536] vector
+    │
+    ▼
+[Pinecone] → upsert(id, vector, {source, chunk_index})
 
 
+RETRIEVAL PHASE (for each user message):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+User: "What is NEFT limit?"
+    │
+    ▼
+[text-embedding-3-small] → query vector float[1536]
+    │
+    ▼
+[Pinecone] → cosine similarity search → top 3 chunks
+    │
+    ▼
+Retrieved chunks:
+  1. "NEFT max per txn: ₹10 lakh, daily: ₹20 lakh..." (score: 0.94)
+  2. "NEFT processes in RBI batch windows 8AM-7PM..." (score: 0.88)
+  3. "NEFT charges: ₹2 up to ₹10,000, ₹5 up to..." (score: 0.81)
+
+
+AUGMENTATION + GENERATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+System Prompt:
+  You are CitiCore banking assistant.
+  
+  [RETRIEVED CONTEXT]
+  NEFT max per txn: ₹10 lakh, daily: ₹20 lakh...
+  NEFT processes in RBI batch windows 8AM-7PM...
+  NEFT charges: ₹2 up to ₹10,000...
+  [END CONTEXT]
+  
+  [CONVERSATION HISTORY - from Redis]
+  User: Hi, I want to send money
+  Assistant: Sure! I can help with that...
+  
+User: "What is NEFT limit?"
+    │
+    ▼
+[GPT-4o] → reads context + history + question
+    │
+    ▼
+"According to CitiCore's policy, the NEFT limit is:
+ - Per transaction: ₹10,00,000 (₹10 lakh)
+ - Daily limit: ₹20,00,000 (₹20 lakh)
+ Charges are ₹2 for amounts up to ₹10,000..."
+```
+
+**RAG in our code:**
+```java
+// ChatService.java — the complete RAG flow
+
+// Step 1: Detect intent
+String intent = intentService.detect(request.getMessage());
+
+// Step 2: RAG Retrieval
+List<Document> retrievedDocs = ragService.retrieve(request.getMessage());
+String context = ragService.formatContextForPrompt(retrievedDocs);
+
+// Step 3: Load conversation history from Redis
+String history = memoryService.formatHistoryForPrompt(session.getId());
+
+// Step 4: Build augmented prompt
+String systemPrompt = buildSystemPrompt(context, accountData, history, name, userId);
+
+// Step 5: Generate with GPT-4o
+String response = chatClient
+    .prompt()
+    .system(systemPrompt)   // ← RAG context is IN HERE
+    .user(request.getMessage())
+    .call()
+    .content();
+```
+
+**RAG vs Fine-tuning (comparison):**
+
+| | RAG | Fine-tuning |
+|---|---|---|
+| Update knowledge | Add new .txt files, re-embed | Retrain the model |
+| Cost | Low (Pinecone free tier) | High ($$$) |
+| Speed | Real-time updates | Hours/days |
+| Best for | Factual, up-to-date knowledge | Style, format, domain tone |
+| Hallucination risk | Low (grounded in docs) | Higher |
+| We use? | ✅ Yes | ❌ No |
+
+---
+
+### 10. Prompt Engineering
+
+**What is it?**
+Prompt Engineering is the practice of crafting inputs (prompts) to LLMs to get accurate, safe, and useful outputs. It's one of the most important skills in GenAI development.
+
+**Types of prompts:**
+
+| Type | Description |
+|---|---|
+| System Prompt | Sets the AI's persona, rules, and context |
+| User Prompt | The actual question/instruction |
+| Assistant Prompt | Previous AI responses (in conversation history) |
+
+**Our system prompt (`system-prompt.st`):**
+```
+You are CitiCore, a helpful and professional AI banking assistant.
+
+## Your Capabilities
+- Answer questions about CitiCore banking products
+- Provide live account balance and transaction data
+- Help with loan eligibility and EMI calculations
+- Share IFSC codes and branch information
+
+## Important Rules
+1. NEVER reveal other customers' information
+2. NEVER make up account numbers — use provided context only
+3. If unsure, offer to connect to human support
+4. For fraud issues, direct to: 1800-XXX-XXXX
+
+## Retrieved Knowledge
+{retrieved_context}   ← RAG docs injected here
+
+## Live Account Data
+{account_context}     ← Live data from account-service
+
+## Conversation History
+{chat_history}        ← Last 10 messages from Redis
+
+## Customer: {customer_name} (ID: {auth_user_id})
+
+Now respond to the customer's latest message.
+```
+
+**Prompt engineering best practices we followed:**
+
+**1. Role Assignment:**
+```
+"You are CitiCore, a professional banking assistant"
+vs
+"Answer banking questions"
+← Role assignment massively improves response quality
+```
+
+**2. Clear Constraints:**
+```
+"NEVER make up account numbers or balances"
+← Prevents hallucination on critical financial data
+```
+
+**3. Context Injection (RAG):**
+```
+[RETRIEVED CONTEXT]
+Actual policy doc here...
+[END CONTEXT]
+← Grounds the model in facts, prevents guessing
+```
+
+**4. Output Format Guidance:**
+```
+"Be concise. Use bullet points for lists.
+ End with a follow-up question if helpful."
+← Consistent, readable responses
+```
+
+**5. Temperature control:**
+```yaml
+temperature: 0.3  # Low = factual, deterministic
+                  # High = creative, unpredictable
+# Banking = LOW temperature (accuracy over creativity)
+```
+
+**Anti-patterns to avoid:**
+```
+❌ "Answer everything the user asks"        → too broad, unsafe
+❌ "Be helpful, harmless, and honest"       → vague, no specifics
+❌ No constraints on sensitive data         → privacy violation risk
+❌ High temperature for banking queries     → inconsistent numbers
+```
+
+---
+
+### 11. Hallucination
+
+**What is it?**
+Hallucination is when an LLM generates factually incorrect, made-up, or nonsensical content — but states it confidently as if it's true.
+
+**Banking hallucination examples:**
+```
+User: "What is CitiCore's NEFT limit?"
+GPT-4o without RAG: "CitiCore's NEFT limit is ₹2 lakh per transaction"
+                     ← WRONG! Made up. Actual limit is ₹10 lakh.
+```
+
+**Why does hallucination happen?**
+- LLMs predict the most statistically probable token — not the most factually correct
+- When the model doesn't "know" something, it invents plausible-sounding content
+- Training data may contain conflicting or outdated information
+
+**How we prevent hallucination in CitiCore Chatbot:**
+
+**1. RAG (primary defense):**
+```
+Always retrieve and inject the actual policy document.
+Prompt: "Use ONLY the provided context to answer.
+         If the context doesn't contain the answer, say so."
+```
+
+**2. Low temperature:**
+```yaml
+temperature: 0.3  # More deterministic = less creative hallucination
+```
+
+**3. Explicit constraints in system prompt:**
+```
+"NEVER state specific account numbers, balances, or amounts
+ that are not explicitly provided in the context or account data."
+```
+
+**4. Grounding with live data:**
+```java
+// For account balance queries — fetch REAL data from account-service
+String accountContext = accountContextService.fetchAccountContext(userId, token);
+// Inject into prompt: "Current balance is ₹42,500 (from live system)"
+```
+
+**5. Graceful fallback:**
+```
+"If you don't know the answer, say:
+ 'I don't have that information. Please call 1800-XXX-XXXX'"
+← Better to admit uncertainty than hallucinate financial data
+```
+
+**Types of hallucination:**
+| Type | Example | Our mitigation |
+|---|---|---|
+| Factual | Wrong interest rate | RAG with policy docs |
+| Numerical | Wrong account balance | Live data from account-service |
+| Temporal | Outdated policy info | Regular knowledge base updates |
+| Confidential | Fabricating other user's data | System prompt rules + JWT isolation |
+
+---
+
+### 12. Fine-Tuning
+
+**What is it?**
+Fine-tuning is the process of taking a pre-trained LLM and continuing to train it on a smaller, domain-specific dataset to adapt its behavior.
+
+**Analogy:**
+- Pre-training = a doctor's 5-year medical degree (general knowledge)
+- Fine-tuning = a 2-year cardiology specialization (domain expertise)
+
+**Types of fine-tuning:**
+
+| Type | Description | Cost |
+|---|---|---|
+| Full fine-tuning | Retrain all model weights | Very expensive |
+| LoRA | Low-Rank Adaptation — only train small adapter matrices | Moderate |
+| PEFT | Parameter Efficient Fine-Tuning | Moderate |
+| RLHF | Reinforcement Learning from Human Feedback (how ChatGPT was trained) | Very expensive |
+| QLoRA | Quantized LoRA — 4-bit precision, runs on consumer GPUs | Low-moderate |
+
+**When to use Fine-tuning vs RAG:**
+
+| Scenario | Use RAG | Use Fine-tuning |
+|---|---|---|
+| "Our bank's NEFT limit is ₹10 lakh" | ✅ | ❌ Overkill |
+| "Always respond in formal Hindi" | ❌ | ✅ Style adaption |
+| "Answer based on our policy docs" | ✅ | ❌ Too expensive |
+| "Sound like a CitiCore agent tone" | ❌ | ✅ Tone/persona |
+| "Know our latest interest rates" | ✅ (update txt file) | ❌ Can't retrain daily |
+
+**Why we chose RAG over Fine-tuning for CitiCore:**
+1. Banking policies change frequently — RAG lets us update a .txt file; fine-tuning requires retraining
+2. Cost: RAG = free (Pinecone free tier); fine-tuning GPT-4o = $$$
+3. Transparency: RAG shows which documents were used; fine-tuned model is a black box
+4. Risk: Fine-tuned model could "bake in" outdated rates
+
+**How fine-tuning works (conceptually):**
+```
+Base GPT-4o (pre-trained on internet) 
+    +
+Training examples:
+  {"prompt": "What is CitiCore tone?", 
+   "completion": "Professional, empathetic, concise..."}
+  × 1000 examples
+    =
+Fine-tuned model: "GPT-4o-CitiCore"
+  → Naturally uses CitiCore's voice
+  → Knows domain-specific terminology
+  → Follows CitiCore's response format
+```
+
+---
+
+### 13. Context Window
+
+**What is it?**
+The context window is the maximum number of tokens an LLM can process in a single request — both input (system prompt + history + question) and output combined.
+
+**GPT-4o context window: 128,000 tokens ≈ 96,000 words ≈ 300 pages**
+
+**Why it matters for our chatbot:**
+```
+System prompt:    ~500 tokens
+RAG docs (3):     ~600 tokens
+Chat history (10):~1,000 tokens
+User question:    ~50 tokens
+─────────────────────────────
+Total input:      ~2,150 tokens
+
+Max GPT-4o output: ~4,096 tokens (our config: max-tokens: 1024)
+─────────────────────────────
+Grand total:      ~3,174 tokens per request
+
+GPT-4o limit: 128,000 tokens
+→ We're well within limits ✅
+→ But monitor token usage as conversations grow long
+```
+
+**How we manage context:**
+```java
+// ConversationMemoryService.java
+// Only keep last 10 messages (not entire history)
+redisTemplate.opsForList().trim(key, -maxHistoryMessages * 2L, -1);
+
+// This prevents: old conversation eating too many tokens
+// Trade-off: model can't reference very old messages
+```
+
+---
+
+### 14. Temperature & Sampling
+
+**What is it?**
+Temperature controls the randomness/creativity of the LLM's output.
+
+```
+Temperature = 0.0  → Fully deterministic. Always picks the single most
+                      likely next token. Consistent but repetitive.
+
+Temperature = 0.3  → Slightly varied. Good for factual Q&A. (WE USE THIS)
+
+Temperature = 0.7  → Balanced. Good for creative writing.
+
+Temperature = 1.0  → Very creative. May hallucinate or go off-topic.
+
+Temperature > 1.0  → Chaotic. Random, often nonsensical.
+```
+
+**Intuition:**
+```
+Question: "What is 2+2?"
+
+Temperature 0.0: "4" (always)
+Temperature 0.3: "4" (almost always, rarely "The answer is 4")
+Temperature 0.7: "4", "The answer is 4", "2+2 equals 4" (varied phrasing)
+Temperature 1.5: "4", "The result is 22 in some base systems", "4 or more" (risky)
+```
+
+**For banking:** Always use low temperature (0.1 - 0.4). Customers need accurate answers, not creative ones.
+
+**Other sampling parameters:**
+
+| Parameter | Effect |
+|---|---|
+| `top_p` | Only sample from tokens whose cumulative probability ≥ p. 0.9 = reasonable |
+| `top_k` | Only consider top K most likely tokens. 40 is common |
+| `max_tokens` | Maximum tokens in output (we use 1024) |
+| `frequency_penalty` | Reduce repetition (0 to 2) |
+| `presence_penalty` | Encourage new topics (0 to 2) |
+
+---
+
+### 15. Cosine Similarity
+
+**What is it?**
+The mathematical formula used to measure how similar two vectors are. Used by Pinecone to rank search results.
+
+**Formula:**
+```
+similarity(A, B) = (A · B) / (|A| × |B|)
+
+Where:
+  A · B  = dot product (multiply corresponding elements, sum them)
+  |A|    = magnitude (length) of vector A
+  |B|    = magnitude (length) of vector B
+```
+
+**Why cosine and not Euclidean distance?**
+```
+Euclidean distance measures absolute distance in space.
+Cosine similarity measures the ANGLE between vectors.
+
+Problem with Euclidean:
+  "NEFT limit" in 100-word doc  → vector magnitude ≈ 5
+  "NEFT limit" in 1000-word doc → vector magnitude ≈ 15
+  (Same meaning, very different Euclidean distance!)
+
+Cosine similarity normalizes by magnitude → length-invariant!
+```
+
+**In Pinecone (our config):**
+```yaml
+distance-type: cosine  # Use cosine similarity
+```
+
+```java
+// Result interpretation in RagService.java
+// threshold: 0.70 means "only return docs with >70% similarity"
+SearchRequest.query(userQuery)
+    .withSimilarityThreshold(0.70)
+```
+
+---
+
+### 16. Attention Mechanism
+
+**What is it?**
+The core innovation in Transformers. Attention allows the model to focus on relevant parts of the input when generating each output token.
+
+**Self-Attention example:**
+```
+Input: "Transfer ₹5000 from my savings to my current account"
+
+When generating the word "savings", the model attends to:
+  "Transfer" (action context)   → HIGH attention
+  "₹5000"    (amount)          → MEDIUM attention  
+  "savings"  (source account)  → HIGH attention
+  "current"  (target)          → LOW attention (not yet relevant)
+
+When generating "current account":
+  "savings"  (source)          → HIGH attention (for context)
+  "current"  (target)          → HIGH attention
+  "Transfer" (action)          → MEDIUM attention
+```
+
+**Multi-head attention:**
+GPT-4o uses multiple attention "heads" simultaneously, each learning to attend to different types of relationships:
+- Head 1: syntactic relationships (subject-verb)
+- Head 2: semantic relationships (banking terms)
+- Head 3: coreference (which "account" are we talking about?)
+- etc.
+
+**Why it matters for our chatbot:**
+When a user says "What about that account?" — the attention mechanism resolves "that account" to the account mentioned earlier in the conversation. This is why chat history in the context window matters.
+
+---
+
+### 17. Zero-Shot, One-Shot, Few-Shot Prompting
+
+**What is it?**
+These describe how many examples you give the model in the prompt.
+
+**Zero-Shot:** No examples — just the instruction
+```
+System: "You are a banking assistant. Answer questions about banking."
+User:   "What is a fixed deposit?"
+← GPT-4o uses its training knowledge. No examples given.
+```
+
+**One-Shot:** One example
+```
+System: "Answer banking questions in this format:
+         Q: What is savings interest?
+         A: CitiCore savings account earns 3.5% p.a., credited quarterly."
+User:   "What is the NEFT limit?"
+← GPT-4o mimics the format/style from the one example.
+```
+
+**Few-Shot:** Multiple examples
+```
+System: "Examples of good responses:
+         Q: What is KYC? A: KYC means Know Your Customer...
+         Q: What is IMPS? A: IMPS is Immediate Payment Service...
+         Q: What is CRR? A: CRR is Cash Reserve Ratio..."
+User:   "What is SLR?"
+← GPT-4o learns the exact response format and domain tone.
+```
+
+**What we use (RAG + few-shot hybrid):**
+Our system prompt provides:
+1. Role definition (zero-shot behavioral instruction)
+2. Retrieved documents (domain knowledge via RAG)
+3. Format guidance in the prompt (implicit few-shot via examples)
+
+---
+
+### 18. Chain of Thought (CoT)
+
+**What is it?**
+A prompting technique where you instruct the model to "think step by step" before giving an answer. Significantly improves accuracy on complex reasoning tasks.
+
+**Standard prompting:**
+```
+User: "Should I take a ₹5 lakh loan at 12% for 36 months if my salary is ₹50,000?"
+GPT-4o: "Yes, you can afford it." ← May be wrong
+```
+
+**Chain of Thought prompting:**
+```
+System: "For financial queries, think step by step:
+         1. Calculate EMI
+         2. Assess EMI/salary ratio  
+         3. Consider other expenses
+         4. Give recommendation with reasoning"
+
+User: "Should I take a ₹5 lakh loan at 12% for 36 months if my salary is ₹50,000?"
+
+GPT-4o: "Let me calculate step by step:
+         1. EMI = [5,00,000 × 0.01 × (1.01)^36] / [(1.01)^36 - 1]
+                = ₹16,607/month
+         2. EMI/Salary ratio = 16,607/50,000 = 33.2%
+            ← RBI recommends max 40-50%, so this is within limits
+         3. After EMI: ₹33,393 remaining
+            Assuming expenses of ₹20,000: ₹13,393 savings
+         4. Recommendation: Financially feasible, but tight.
+            Consider building 3-month emergency fund first."
+← Much more accurate and trustworthy!
+```
+
+**We implement this in our EMI queries via the system prompt:**
+```
+For loan/EMI questions, show:
+1. The formula used
+2. Step-by-step calculation
+3. Final recommendation
+```
+
+---
+
+### 19. Semantic Search vs Keyword Search
+
+**What is it?**
+
+| | Keyword Search | Semantic Search |
+|---|---|---|
+| How | Match exact words | Match meaning |
+| Technology | Inverted index (Elasticsearch, LIKE) | Vector similarity (Pinecone) |
+| Query | "NEFT limit" | "How much money can I transfer?" |
+| Example match | Only finds docs with exact "NEFT limit" | Finds docs about "transfer restrictions", "fund transfer caps" |
+| Our use | Not used | ✅ Used via Pinecone |
+
+**Why semantic search is critical for banking chatbots:**
+```
+User asks: "Can I send my friend 10 lakhs?"
+
+Keyword search: No match (no document contains "send my friend")
+Semantic search: Matches "fund transfer limits" document (0.87 similarity)
+                 → "NEFT daily limit is ₹20 lakh, IMPS is ₹10 lakh"
+```
+
+---
+
+## 🔄 How All Concepts Work Together
+
+```
+User: "What is my savings balance and can I take a 5 lakh loan?"
+  │
+  ▼ JWT Authentication (Security)
+  │
+  ▼ Intent Detection: ACCOUNT + LOAN (NLP)
+  │
+  ├─► Account Context: HTTP → account-service → "Balance: ₹42,500" (Microservices)
+  │
+  ├─► Redis: Load last 10 messages (Conversation Memory)
+  │
+  ├─► Embed query → [0.23, 0.71, -0.44 ... 1536 floats] (Embeddings)
+  │
+  ├─► Pinecone: Cosine similarity search → top 3 chunks (Vector DB + RAG)
+  │     └─ "Savings account: 3.5% p.a." (score: 0.89)
+  │     └─ "Personal loan eligibility: min ₹25K income" (score: 0.85)
+  │     └─ "EMI formula: P×r×(1+r)^n / [(1+r)^n-1]" (score: 0.82)
+  │
+  ▼ Build System Prompt (Prompt Engineering)
+  │  [Role + Rules + RAG Context + Account Data + History]
+  │
+  ▼ GPT-4o API call (LLM + Transformer + Tokenization)
+  │  Input tokens: ~2,100 | Temperature: 0.3
+  │  Transformer attention: resolves "my balance" → ₹42,500
+  │
+  ▼ Response: "Your savings balance is ₹42,500. For a ₹5 lakh loan..."
+  │
+  ├─► Save to Redis (30-min TTL) (Conversation Memory)
+  ├─► Save to MySQL (permanent) (Persistence)
+  └─► Kafka: chat.analytics event (Async, Non-blocking)
+```
+
+---
+
+## 🚀 Setup & Running Locally
+
+### Prerequisites
+```bash
+# 1. Get FREE API keys
+# OpenAI: https://platform.openai.com/api-keys (GPT-4o needs paid tier)
+# Pinecone: https://app.pinecone.io (create index: dims=1536, metric=cosine)
+
+# 2. Start infrastructure
+docker-compose up -d   # MySQL + Kafka + Zookeeper + Kafka UI + Redis
+
+# 3. Set environment variables
+export OPENAI_API_KEY=sk-...your_key
+export PINECONE_API_KEY=...your_key
+```
+
+### Run All Services
+```bash
+cd auth-service        && mvn spring-boot:run   # :8081
+cd user-service        && mvn spring-boot:run   # :8082
+cd account-service     && mvn spring-boot:run   # :8083
+cd transaction-service && mvn spring-boot:run   # :8084
+cd notification-service && mvn spring-boot:run  # :8085
+cd chatbot-service     && mvn spring-boot:run   # :8086
+# On startup: knowledge base auto-loads into Pinecone (~30 seconds)
+```
+
+### Test the Chatbot
+```bash
+# 1. Register + Login (auth-service)
+# 2. Create profile (user-service)
+# 3. Open account (account-service)
+# 4. Test chatbot
+curl -X POST http://localhost:8086/api/v1/chatbot/chat \
+  -H "Authorization: Bearer YOUR_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{"authUserId": 1, "message": "What is NEFT limit?", "customerName": "Rabbani"}'
+```
+
+---
+
+## 🐳 CI/CD Pipeline
+
+```
+GitHub Push
+    │
+    ▼
+Jenkins (5 stages)
+    │
+    ├─ Stage 1: Checkout (git pull)
+    ├─ Stage 2: Build & Test (mvn clean package)
+    ├─ Stage 3: Docker Build (docker build -t user/citicore-chatbot:42)
+    ├─ Stage 4: Push to Docker Hub (docker push)
+    └─ Stage 5: Deploy to AWS EC2
+                  └─ SSH → docker pull → docker stop old → docker run new
+                  └─ Health check: GET /api/v1/chatbot/health
+```
+
+---
+
+## 🎯 Interview Q&A
+
+**Q: What is RAG and why did you use it over fine-tuning?**
+> RAG retrieves relevant documents from a knowledge base and injects them into the prompt before calling the LLM. I chose RAG because: (1) Banking policies change frequently — RAG lets me update a text file; fine-tuning needs model retraining. (2) Zero hallucination risk on policy data since the LLM reads actual documents. (3) Cost — RAG with Pinecone free tier vs fine-tuning GPT-4 which costs thousands of dollars.
+
+**Q: How does Pinecone find relevant documents so fast?**
+> Pinecone uses HNSW (Hierarchical Navigable Small World) algorithm — a graph-based approximate nearest neighbor search. It builds multi-layer graphs where top layers provide coarse navigation and bottom layers precise matching. This achieves millisecond search times over millions of vectors vs brute-force cosine similarity which would be O(n) and too slow.
+
+**Q: What is the difference between a vector and an embedding?**
+> A vector is just a list of numbers `[0.12, -0.83, 0.45...]`. An embedding is a specific type of vector produced by a neural network that encodes the **semantic meaning** of text. So all embeddings are vectors, but not all vectors are embeddings.
+
+**Q: Why use Redis instead of MySQL for conversation history?**
+> Redis is in-memory (<1ms reads) vs MySQL (20-50ms). Since we include conversation history in EVERY GPT-4o API call, MySQL latency would add up noticeably. Redis also has built-in TTL — sessions automatically expire after 30 minutes without code changes.
+
+**Q: How does tokenization affect your system design?**
+> GPT-4o costs per token and has a 128K token limit. I limit conversation history to 10 messages in Redis to prevent context overflow. I also track token usage per message in MySQL for cost monitoring and publish to Kafka for analytics.
+
+**Q: What is hallucination and how did you prevent it?**
+> Hallucination is when an LLM generates confident but incorrect information. I prevent it through: (1) RAG — LLM reads actual policy docs, not guessing. (2) Low temperature (0.3) — less creative randomness. (3) System prompt constraints — "NEVER state balances not in the context". (4) Live account data injection for balance queries — real numbers from account-service.
+
+**Q: Explain the difference between temperature 0.0 and 1.0**
+> Temperature controls randomness. At 0.0 the model always picks the most likely next token — deterministic, consistent, factual. At 1.0 it samples more broadly — creative, varied, but risks inaccuracy. For banking I use 0.3 — mostly deterministic with slight variation for natural language.
+
+**Q: What is chunking and what chunk size did you use?**
+> Chunking splits documents into smaller pieces before embedding. I used 500-character chunks with 50-character overlap. The overlap prevents losing context when a sentence spans two chunks. Fixed-size chunking at natural boundaries (paragraphs/sentences) gives the best retrieval precision.
+
+**Q: What is the role of Spring AI in your project?**
+> Spring AI is an abstraction layer over AI providers — similar to how JDBC abstracts databases. Instead of raw HTTP calls to OpenAI, I use `ChatClient.prompt().user().call()`. The benefit: switching from GPT-4o to Claude or Gemini requires only one line change in `application.yml`, zero Java code changes.
+
+---
+
+## 📚 Additional Resources
+
+- [Spring AI Documentation](https://docs.spring.io/spring-ai/reference/)
+- [OpenAI API Reference](https://platform.openai.com/docs/api-reference)
+- [Pinecone Documentation](https://docs.pinecone.io)
+- [Attention Is All You Need (Transformer Paper)](https://arxiv.org/abs/1706.03762)
+- [RAG Paper — Lewis et al. 2020](https://arxiv.org/abs/2005.11401)
+- [OpenAI Tokenizer](https://platform.openai.com/tokenizer)
+
+---
