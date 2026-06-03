@@ -19,11 +19,6 @@
 11. [Quick Reference Card](#11-quick-reference-card)
 
 ---
-# 🚀 Artificial Intelligence (AI), Machine Learning (ML), and Deep Learning (DL) – Interview Explanation
-
-If an interviewer asks **"What are AI, ML, and Deep Learning, and what are the differences between them?"**, you can answer like this:
-
----
 
 ## 0. What is Artificial Intelligence (AI)?
 
