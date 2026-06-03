@@ -5,7 +5,7 @@
 ---
 
 ## 📋 Table of Contents
-
+0. [What is Artificial Intelligence (AI)?](#0-What-is-Artificial-Intelligence-(AI)?)
 1. [What is Machine Learning?](#1-what-is-machine-learning)
 2. [How ML Works — The Lifecycle](#2-how-ml-works--the-lifecycle)
 3. [Types of Machine Learning](#3-types-of-machine-learning)
@@ -18,6 +18,43 @@
 10. [Interview Q&A — All Topics](#10-interview-qa)
 11. [Quick Reference Card](#11-quick-reference-card)
 
+---
+# 🚀 Artificial Intelligence (AI), Machine Learning (ML), and Deep Learning (DL) – Interview Explanation
+
+If an interviewer asks **"What are AI, ML, and Deep Learning, and what are the differences between them?"**, you can answer like this:
+
+---
+
+## 0. What is Artificial Intelligence (AI)?
+
+**Artificial Intelligence (AI)** is a broad field of computer science that focuses on building machines and systems capable of performing tasks that normally require human intelligence.
+
+These tasks include:
+
+* Understanding language
+* Making decisions
+* Recognizing images
+* Solving problems
+* Learning from experience
+* Playing games
+* Driving vehicles
+
+The goal of AI is to make machines think and act intelligently like humans.
+
+### Example
+
+* ChatGPT answering questions
+* Self-driving cars
+* Voice assistants like Siri and Alexa
+* Recommendation systems in Netflix and YouTube
+
+Think of AI as the **largest umbrella** that contains Machine Learning and Deep Learning.
+
+```
+AI
+ ├── Machine Learning
+ │      └── Deep Learning
+```
 ---
 
 ## 1. What is Machine Learning?
